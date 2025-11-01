@@ -1,0 +1,25 @@
+Resumo do processamento:
+- Input: C:\Users\Natanael\Documents\NEES\video-compressor-desktop\tmp_samples\test_input.zip
+- Output: C:\Users\Natanael\Documents\NEES\video-compressor-desktop\tmp_samples\out\test_input.compressed.zip
+- Tamanho original do arquivo: 650.0B
+- Tamanho final do arquivo: 669.0B
+- Reducao do arquivo final: 0.0B (0.0%)
+- Economias em midias recomprimidas: 0.0B (0.0%)
+- Parametros de compressao: imagens qualidade=85; videos CRF=23; encoder requisitado=auto; preferencia GPU=sim
+- Estimativa de perda (imagens): qualidade alvo 85 com reducao media 0.0%
+- Estimativa de perda (videos): CRF 23 com reducao media 0.0%
+
+Total imagens: 1
+Total videos: 0
+Total imagens comprimidas: 0
+Total imagens mantidas (sem ganho): 1
+Economia total: 0.0B
+
+Imagens comprimidas:
+- Nenhuma
+
+Imagens mantidas (sem ganho):
+- OPS\image.png | motivo: no-gain
+
+Videos comprimidos:
+- Nenhum
