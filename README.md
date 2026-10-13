@@ -64,6 +64,17 @@ Observacoes importantes:
 - Caso queira forcar dependencia limpa, execute o script com `-RecreateVenv`.
 - Para distribuir, copie a pasta `dist\VideoCompressorDesktop` para a maquina destino e execute `VideoCompressorDesktop.exe`.
 
+## Pacote para distribuicao
+
+Depois do build, gere o ZIP para compartilhar ou anexar a uma release no GitHub:
+```powershell
+.\scripts\package_release.ps1
+```
+
+O pacote e criado em `dist\EncodeXlabDesktop-Windows-x64.zip`, com a pasta inteira do aplicativo, a licenca e instrucoes de uso. Extraia todo o ZIP antes de executar; Python nao e necessario na maquina destino, mas FFmpeg/ffprobe devem estar no `PATH`.
+
+Os arquivos de `tmp_samples/` sao exemplos sinteticos. Resultados e logs gerados ficam fora do controle de versao para evitar publicar caminhos locais ou obras processadas.
+
 ## Uso via linha de comando
 ```powershell
 python -m src.main -i  "c:\caminho\arquivo.epub.zip"
@@ -133,4 +144,4 @@ requirements.txt
 - [x] Processamento paralelo de obras diferentes.
 
 ## Licenca
-MIT
+Este projeto utiliza a [licenca MIT](LICENSE).

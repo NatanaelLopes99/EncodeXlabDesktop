@@ -33,3 +33,8 @@ dist/
 .tmp/
 .temp/
 .review/
+
+# Generated sample outputs
+tmp_samples/out/
+*.compressed*.zip
+*.log.txt
