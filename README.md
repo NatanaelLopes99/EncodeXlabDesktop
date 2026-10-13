@@ -4,6 +4,10 @@ Aplicativo em Python para reduzir o tamanho de arquivos `.epub.zip`, recomprimin
 
 Esta e a versao desktop do projeto, com interface Tkinter e processamento de obras ZIP/EPUB. A primeira versao web esta no repositorio `EncodeXlab`; o desenvolvimento desta aplicacao continua em [EncodeXlabDesktop](https://github.com/NatanaelLopes99/EncodeXlabDesktop).
 
+## Interface
+
+![Interface do Video Compressor Desktop para EPUB](docs/images/interface.png)
+
 ## Principais recursos
 - CLI (`python -m src.main`) com suporte a arquivos isolados, diretorios e multiplos `-i` em lote, alem da GUI (Tkinter).
 - Imagens e videos so sao substituidos quando o novo arquivo fica menor que o original.
