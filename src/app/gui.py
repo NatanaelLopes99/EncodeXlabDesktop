@@ -1,11 +1,13 @@
 ﻿from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 import time
 import tkinter as tk
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional, Tuple
 
@@ -21,6 +23,7 @@ from src.core.epub_processor import (
     write_batch_summary_log,
 )
 from src.utils.cache import clear_temp_cache
+from src.utils.fs import move_output_file
 
 console = Console()
 
@@ -33,13 +36,17 @@ class App(tk.Tk):
         self.minsize(640, 420)
 
         self.processing = False
+        self.cancel_event = Event()
+        self.worker_thread: Optional[Thread] = None
 
         self.input_path_var = tk.StringVar()
         self.output_path_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Pronto.")
         self.image_quality_var = tk.IntVar(value=DEFAULT_IMAGE_QUALITY)
         self.video_crf_var = tk.IntVar(value=DEFAULT_VIDEO_CRF)
+        self.video_crf_fallback_var = tk.StringVar()
         self.workers_var = tk.IntVar(value=1)
+        self.sound_path_var = tk.StringVar()
 
         self._build_layout()
 
@@ -95,6 +102,15 @@ class App(tk.Tk):
             width=5,
         ).pack(side=tk.LEFT, padx=(6, 0))
 
+        fallback_row = ttk.Frame(options_frame)
+        fallback_row.pack(fill=tk.X, pady=(2, 4))
+        ttk.Label(fallback_row, text="CRFs alternativos (ex: 22,24):").pack(side=tk.LEFT)
+        ttk.Entry(
+            fallback_row,
+            textvariable=self.video_crf_fallback_var,
+            width=16,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
         workers_row = ttk.Frame(options_frame)
         workers_row.pack(fill=tk.X, pady=(2, 4))
         ttk.Label(workers_row, text="Processos paralelos:").pack(side=tk.LEFT)
@@ -106,11 +122,22 @@ class App(tk.Tk):
             width=5,
         ).pack(side=tk.LEFT, padx=(6, 0))
 
+        sound_row = ttk.Frame(options_frame)
+        sound_row.pack(fill=tk.X, pady=(2, 4))
+        ttk.Label(sound_row, text="Som ao finalizar:").pack(side=tk.LEFT)
+        ttk.Entry(sound_row, textvariable=self.sound_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Button(sound_row, text="Escolher...", command=self.pick_sound_file).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(sound_row, text="Limpar", command=self.clear_sound_file).pack(side=tk.LEFT, padx=(6, 0))
+
         controls = ttk.Frame(container)
         controls.pack(fill=tk.X, pady=(0, 8))
 
         self.process_button = ttk.Button(controls, text="Processar obras", command=self.start_processing)
         self.process_button.pack(side=tk.LEFT)
+        self.cancel_button = ttk.Button(
+            controls, text="Parar", command=self.stop_processing, state=tk.DISABLED
+        )
+        self.cancel_button.pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Button(controls, text="Limpar log", command=self.clear_log).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(controls, text="Limpar cache", command=self.clear_cache).pack(side=tk.LEFT, padx=(8, 0))
@@ -191,6 +218,29 @@ class App(tk.Tk):
             message = "\n".join(message_lines)
             messagebox.showinfo("Limpeza de cache", message)
 
+    def pick_sound_file(self) -> None:
+        current = self.sound_path_var.get().strip()
+        initial_dir = None
+        if current:
+            current_path = Path(current).expanduser()
+            if current_path.exists():
+                initial_dir = str(current_path.parent)
+        dialog_options = {
+            "title": "Selecionar som de conclusao",
+            "filetypes": (
+                ("Arquivos de audio", "*.wav *.mp3 *.ogg *.flac *.m4a *.aac"),
+                ("Todos os arquivos", "*.*"),
+            ),
+        }
+        if initial_dir:
+            dialog_options["initialdir"] = initial_dir
+        file_path = filedialog.askopenfilename(**dialog_options)
+        if file_path:
+            self.sound_path_var.set(file_path)
+
+    def clear_sound_file(self) -> None:
+        self.sound_path_var.set("")
+
     def append_log(self, text: str) -> None:
         self._update_log("append", text)
 
@@ -199,6 +249,14 @@ class App(tk.Tk):
             self.status_var.set(text)
 
         self.after(0, apply)
+
+    def stop_processing(self) -> None:
+        if not self.processing or self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.append_log("Cancelamento solicitado. Aguardando tarefas em andamento...")
+        self.set_status("Cancelando processamento...")
 
     def _update_log(self, action: str, text: str | None = None) -> None:
         def apply() -> None:
@@ -247,6 +305,31 @@ class App(tk.Tk):
             messagebox.showerror("Valor invalido", "Informe um numero entre 0 e 51 para o CRF do video.")
             return
 
+        fallback_raw = self.video_crf_fallback_var.get().strip()
+        fallback_values: List[int] = []
+        if fallback_raw:
+            sanitized = fallback_raw.replace(";", ",")
+            for chunk in sanitized.split(","):
+                part = chunk.strip()
+                if not part:
+                    continue
+                try:
+                    value = int(part)
+                except ValueError:
+                    messagebox.showerror("Valor invalido", f"CRF alternativo invalido: {part}")
+                    return
+                value = max(0, min(value, 51))
+                if value >= video_crf:
+                    messagebox.showerror(
+                        "Valor invalido",
+                        f"CRFs alternativos precisam ser menores que o CRF principal ({video_crf}).",
+                    )
+                    return
+                if value not in fallback_values:
+                    fallback_values.append(value)
+            self.video_crf_fallback_var.set(",".join(str(v) for v in fallback_values))
+        fallback_tuple = tuple(fallback_values)
+
         try:
             workers = int(self.workers_var.get())
         except (tk.TclError, ValueError):
@@ -256,22 +339,26 @@ class App(tk.Tk):
             messagebox.showerror("Valor invalido", "Informe um numero maior ou igual a 1 para processos paralelos.")
             return
 
+        self.cancel_event.clear()
         self.processing = True
         self.process_button.configure(state=tk.DISABLED)
+        self.cancel_button.configure(state=tk.NORMAL)
         self.set_status("Processando obras...")
         self.append_log("Iniciando processamento...")
+        fallback_text = f"; fallback CRFs={','.join(str(v) for v in fallback_values)}" if fallback_values else ""
         self.append_log(
-            f"Parametros: imagem qualidade={image_quality}; video CRF={video_crf}; processos={workers}"
+            f"Parametros: imagem qualidade={image_quality}; video CRF={video_crf}{fallback_text}; processos={workers}"
         )
 
         start_time = time.perf_counter()
 
         worker = Thread(
             target=self._process_worker,
-            args=(input_path, output_path, image_quality, video_crf, workers, start_time),
+            args=(input_path, output_path, image_quality, video_crf, fallback_tuple, workers, start_time),
             daemon=True,
         )
         worker.start()
+        self.worker_thread = worker
 
     def _process_worker(
         self,
@@ -279,9 +366,11 @@ class App(tk.Tk):
         output_path: Path | None,
         image_quality: int,
         video_crf: int,
+        fallback_crfs: Tuple[int, ...],
         workers: int,
         start_time: float,
     ) -> None:
+        cancelled = False
         try:
             files = self._collect_zip_files(input_path)
             if not files:
@@ -292,6 +381,7 @@ class App(tk.Tk):
                     failures=[],
                     summary_path=None,
                     duration=duration,
+                    cancelled=False,
                 )
                 return
 
@@ -368,6 +458,12 @@ class App(tk.Tk):
                         queued_notice_shown = False
 
                         for idx, file_path in enumerate(files, start=1):
+                            if self.cancel_event.is_set():
+                                cancelled = True
+                                self.append_log(
+                                    "Cancelamento solicitado. Interrompendo atribuicao de novas tarefas paralelas."
+                                )
+                                break
                             if idx <= preview_limit:
                                 self.append_log(f"[Fila] Iniciando: {file_path}")
                             elif not queued_notice_shown:
@@ -380,10 +476,23 @@ class App(tk.Tk):
                                 file_path,
                                 image_quality=image_quality,
                                 video_crf=video_crf,
+                                fallback_crfs=fallback_crfs,
                             )
                             future_to_meta[future] = file_path
 
+                        if cancelled:
+                            for future in future_to_meta:
+                                future.cancel()
                         for future in as_completed(future_to_meta):
+                            if self.cancel_event.is_set() and not cancelled:
+                                cancelled = True
+                                self.append_log(
+                                    "Cancelamento solicitado. Aguardando tarefas paralelas em andamento finalizarem."
+                                )
+                                for pending in future_to_meta:
+                                    pending.cancel()
+                            if future.cancelled():
+                                continue
                             file_path = future_to_meta[future]
                             try:
                                 result = future.result()
@@ -397,10 +506,16 @@ class App(tk.Tk):
                     self.append_log(f"Processamento paralelo falhou ({exc}). Alternando para modo sequencial.")
                     processed_in_parallel = False
 
-            if not processed_in_parallel:
+            cancelled = cancelled or self.cancel_event.is_set()
+
+            if not processed_in_parallel and not cancelled:
                 completed_count = len(successes)
                 remaining_files = [fp for fp in files if fp not in processed_inputs]
                 for idx, file_path in enumerate(remaining_files, start=1):
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                        self.append_log("Cancelamento solicitado. Interrompendo processamento sequencial.")
+                        break
                     next_index = completed_count + 1
                     self.append_log(f"[{next_index}/{total}] Processando: {file_path}")
                     try:
@@ -408,6 +523,7 @@ class App(tk.Tk):
                             file_path,
                             image_quality=image_quality,
                             video_crf=video_crf,
+                            fallback_crfs=fallback_crfs,
                         )
                         finalize_result(result)
                     except Exception as exc:
@@ -433,6 +549,7 @@ class App(tk.Tk):
                 failures=failures,
                 summary_path=summary_path,
                 duration=duration,
+                cancelled=cancelled,
             )
         finally:
             self.after(0, self._reset_ui_state)
@@ -444,11 +561,42 @@ class App(tk.Tk):
         failures: List[tuple[Path, Exception]],
         summary_path: Optional[Path],
         duration: float,
+        cancelled: bool,
     ) -> None:
         def notify() -> None:
+            formatted_duration = self._format_duration(duration)
+            if cancelled:
+                self.set_status("Cancelado.")
+                if successes or failures:
+                    self.append_log(f"Processamento cancelado apos {formatted_duration} ({duration:.2f}s).")
+                else:
+                    self.append_log("Processamento cancelado pelo usuario.")
+
+                summary_lines = []
+                if successes:
+                    summary_lines.append(f"Processados antes do cancelamento: {len(successes)}")
+                    for item in successes:
+                        summary_lines.append(f"- {item.output_path}")
+                        if item.log_path:
+                            summary_lines.append(f"  Log: {item.log_path}")
+                if failures:
+                    summary_lines.append("")
+                    summary_lines.append(f"Falhas registradas: {len(failures)}")
+                    for path, error in failures:
+                        summary_lines.append(f"- {path} -> {error}")
+                if successes or failures:
+                    summary_lines.append("")
+                    summary_lines.append(f"Tempo ate o cancelamento: {formatted_duration} ({duration:.2f}s)")
+                if summary_path is not None:
+                    summary_lines.append(f"Resumo geral: {summary_path}")
+                if not summary_lines:
+                    summary_lines.append("Nenhum arquivo processado antes do cancelamento.")
+
+                messagebox.showinfo("Processamento cancelado", "\n".join(summary_lines))
+                return
+
             self.set_status("Pronto.")
 
-            formatted_duration = self._format_duration(duration)
             if successes:
                 self.append_log(f"Processamento concluido com {len(successes)} arquivo(s) gerado(s).")
             if failures:
@@ -477,9 +625,75 @@ class App(tk.Tk):
                 summary_lines.append(f"Tempo total: {formatted_duration} ({duration:.2f}s)")
 
             summary = "\n".join(summary_lines) if summary_lines else "Nenhum arquivo processado."
+            self._play_completion_sound()
             messagebox.showinfo("Processamento finalizado", summary)
 
         self.after(0, notify)
+
+    def _play_completion_sound(self) -> None:
+        path_text = self.sound_path_var.get().strip()
+        if not path_text:
+            return
+
+        sound_path = Path(path_text).expanduser()
+        if not sound_path.exists():
+            self.append_log(f"Som de conclusao nao encontrado: {sound_path}")
+            return
+
+        def _run() -> None:
+            if sys.platform.startswith("win"):
+                try:
+                    import winsound  # type: ignore
+
+                    winsound.PlaySound(str(sound_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    return
+                except Exception:
+                    pass
+
+            ffplay = shutil.which("ffplay")
+            if ffplay:
+                try:
+                    subprocess.Popen(
+                        [ffplay, "-nodisp", "-autoexit", str(sound_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return
+                except Exception:
+                    pass
+
+            if sys.platform == "darwin":
+                afplay = shutil.which("afplay")
+                if afplay:
+                    try:
+                        subprocess.Popen(
+                            [afplay, str(sound_path)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        return
+                    except Exception:
+                        pass
+
+            if sys.platform.startswith("linux"):
+                player = shutil.which("paplay") or shutil.which("aplay") or shutil.which("cvlc")
+                if player:
+                    try:
+                        args = [player, str(sound_path)]
+                        if Path(player).name.lower() == "cvlc":
+                            args.insert(1, "--play-and-exit")
+                        subprocess.Popen(
+                            args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        return
+                    except Exception:
+                        pass
+
+            self.append_log("Nao foi possivel reproduzir o som de conclusao.")
+
+        Thread(target=_run, daemon=True).start()
 
     @staticmethod
     def _format_duration(seconds: float) -> str:
@@ -491,6 +705,9 @@ class App(tk.Tk):
     def _reset_ui_state(self) -> None:
         self.processing = False
         self.process_button.configure(state=tk.NORMAL)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.cancel_event.clear()
+        self.worker_thread = None
 
     def _collect_zip_files(self, path: Path) -> List[Path]:
         files: List[Path] = []
@@ -531,26 +748,8 @@ class App(tk.Tk):
         return True
 
     def _move_result(self, result: ArchiveProcessResult, destination_dir: Path) -> None:
-        destination_dir = destination_dir.expanduser().resolve()
-        destination_dir.mkdir(parents=True, exist_ok=True)
-
-        source = result.output_path
-        destination = destination_dir / source.name
-        if source == destination:
-            result.output_path = destination
-            return
-        if destination.exists():
-            destination.unlink()
-        try:
-            shutil.move(str(source), destination)
-        except Exception:
-            shutil.copy2(str(source), destination)
-        if source.exists():
-            try:
-                source.unlink()
-            except OSError:
-                self.append_log(f"Aviso: nao foi possivel remover '{source}' apos mover.")
-        result.output_path = destination
+        destination = destination_dir / result.output_path.name
+        result.output_path = move_output_file(result.output_path, destination, result.input_path)
 
 
 def main() -> None:
@@ -559,4 +758,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from multiprocessing import freeze_support
+
+    freeze_support()
     main()

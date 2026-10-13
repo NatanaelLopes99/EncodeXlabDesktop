@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import tempfile
+import shutil
 from datetime import datetime
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Dict, List, Optional, Tuple
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 from rich.console import Console
 
-from src.utils.fs import iter_files
+from src.utils.fs import iter_files, open_unique_output
 from src.utils.system_info import collect_system_info
 
 from .compression_result import CompressionResult
@@ -26,6 +27,24 @@ IMAGE_EXTS = {ext.lower() for ext in SUPPORTED_IMAGE_EXTENSIONS}
 VIDEO_EXTS = {ext.lower() for ext in SUPPORTED_VIDEO_EXTENSIONS}
 
 
+def _normalize_video_fallback_crfs(
+    candidates: Optional[Tuple[int, ...]],
+    requested_crf: int,
+) -> Tuple[int, ...]:
+    normalized: list[int] = []
+    if not candidates:
+        return tuple()
+    for raw in candidates:
+        if raw is None:
+            continue
+        value = int(max(0, min(int(raw), 51)))
+        if value >= requested_crf:
+            continue
+        if value not in normalized:
+            normalized.append(value)
+    return tuple(normalized)
+
+
 @dataclass(slots=True)
 class ArchiveProcessResult:
     input_path: Path
@@ -35,6 +54,7 @@ class ArchiveProcessResult:
     error_results: List[CompressionResult]
     image_quality: int
     video_crf: int
+    video_crf_fallbacks: Tuple[int, ...]
     prefer_gpu: bool
     requested_encoder: Optional[str]
     log_path: Optional[Path] = None
@@ -68,6 +88,7 @@ def process_epub_zip(
     input_zip: Path,
     image_quality: int = DEFAULT_IMAGE_QUALITY,
     video_crf: int = DEFAULT_VIDEO_CRF,
+    fallback_crfs: Optional[Tuple[int, ...]] = None,
     prefer_gpu: bool = True,
     encoder: Optional[str] = None,
 ) -> ArchiveProcessResult:
@@ -94,10 +115,13 @@ def process_epub_zip(
         with ZipFile(input_zip, "r") as zf:
             extract_errors = _safe_extractall(zf, extract_dir, input_zip)
 
+        effective_fallbacks = _normalize_video_fallback_crfs(fallback_crfs, video_crf)
+
         summary = _process_extracted_content(
             extract_dir,
             image_quality=image_quality,
             video_crf=video_crf,
+            fallback_crfs=effective_fallbacks,
             prefer_gpu=prefer_gpu,
             encoder=encoder,
         )
@@ -106,7 +130,7 @@ def process_epub_zip(
 
         final_zip = _build_output_path(input_zip)
         console.print(f"Writing final archive: {final_zip}")
-        make_zip_from_dir(extract_dir, final_zip)
+        final_zip = make_zip_from_dir(extract_dir, final_zip)
 
     processing_seconds = time.perf_counter() - start_time
     final_archive_size = final_zip.stat().st_size if final_zip.exists() else 0
@@ -119,6 +143,7 @@ def process_epub_zip(
         error_results=summary.get("errors", []),
         image_quality=image_quality,
         video_crf=video_crf,
+        video_crf_fallbacks=effective_fallbacks,
         prefer_gpu=prefer_gpu,
         requested_encoder=encoder,
         original_archive_size=original_archive_size,
@@ -134,6 +159,7 @@ def _process_extracted_content(
     root: Path,
     image_quality: int,
     video_crf: int,
+    fallback_crfs: Optional[Tuple[int, ...]],
     prefer_gpu: bool,
     encoder: Optional[str],
 ) -> Dict[str, List[CompressionResult]]:
@@ -149,10 +175,14 @@ def _process_extracted_content(
                 epub_tmp_path.mkdir(parents=True, exist_ok=True)
 
                 with ZipFile(epub_file, "r") as epub_zf:
-                    epub_zf.extractall(epub_tmp_path)
+                    epub_errors = _safe_extractall(epub_zf, epub_tmp_path, epub_file)
+                if epub_errors:
+                    # Keep the original EPUB rather than replace it with incomplete content.
+                    results["errors"].extend(epub_errors)
+                    continue
 
                 dir_results = _compress_media_in_dir(
-                    epub_tmp_path, image_quality, video_crf, prefer_gpu, encoder
+                    epub_tmp_path, image_quality, video_crf, fallback_crfs, prefer_gpu, encoder
                 )
                 _merge_results(results, dir_results)
 
@@ -161,7 +191,9 @@ def _process_extracted_content(
                 rebuilt_epub.replace(epub_file)
     else:
         console.print("No .epub file found inside the archive. Compressing extracted content directly.")
-        dir_results = _compress_media_in_dir(root, image_quality, video_crf, prefer_gpu, encoder)
+        dir_results = _compress_media_in_dir(
+            root, image_quality, video_crf, fallback_crfs, prefer_gpu, encoder
+        )
         _merge_results(results, dir_results)
 
     return results
@@ -171,6 +203,7 @@ def _compress_media_in_dir(
     root: Path,
     image_quality: int,
     video_crf: int,
+    fallback_crfs: Optional[Tuple[int, ...]],
     prefer_gpu: bool,
     encoder: Optional[str],
 ) -> Dict[str, List[CompressionResult]]:
@@ -193,6 +226,7 @@ def _compress_media_in_dir(
                 result = compress_video_file(
                     file,
                     crf=video_crf,
+                    fallback_crfs=fallback_crfs,
                     encoder=encoder,
                     prefer_gpu=prefer_gpu,
                 )
@@ -220,16 +254,29 @@ def _merge_results(
 
 def _safe_extractall(zf: ZipFile, destination: Path, archive_path: Path) -> List[CompressionResult]:
     errors: List[CompressionResult] = []
+    destination = destination.resolve()
     for info in zf.infolist():
-        member_path = destination / info.filename
-        if info.is_dir():
-            member_path.mkdir(parents=True, exist_ok=True)
-            continue
-        member_path.parent.mkdir(parents=True, exist_ok=True)
+        member_path = None
+        created = False
         try:
-            zf.extract(info, destination)
+            name = info.filename.replace("\\", "/")
+            relative = Path(name)
+            if (PureWindowsPath(name).drive or relative.is_absolute()
+                    or ".." in relative.parts or any(":" in part for part in relative.parts)):
+                raise ValueError("caminho fora da pasta de extracao")
+            member_path = (destination / relative).resolve()
+            if not member_path.is_relative_to(destination) or member_path == destination:
+                raise ValueError("caminho fora da pasta de extracao")
+            if info.is_dir():
+                member_path.mkdir(parents=True, exist_ok=True)
+                continue
+            member_path.parent.mkdir(parents=True, exist_ok=True)
+            with member_path.open("xb") as output:
+                created = True
+                with zf.open(info) as original:
+                    shutil.copyfileobj(original, output)
         except Exception as exc:
-            if member_path.exists():
+            if created and member_path is not None:
                 try:
                     member_path.unlink()
                 except OSError:
@@ -279,18 +326,21 @@ def make_epub_archive(folder: Path, out_epub: Path) -> None:
             zf.write(file, arcname, compress_type=ZIP_DEFLATED)
 
 
-def make_zip_from_dir(folder: Path, out_zip: Path) -> None:
+def make_zip_from_dir(folder: Path, out_zip: Path) -> Path:
     folder = Path(folder)
     out_zip = Path(out_zip)
-    if out_zip.exists():
-        out_zip.unlink()
-
-    with ZipFile(out_zip, "w", compression=ZIP_DEFLATED) as zf:
-        for file in folder.rglob("*"):
-            if not file.is_file():
-                continue
-            arcname = file.relative_to(folder)
-            zf.write(file, arcname)
+    final_zip, output = open_unique_output(out_zip)
+    try:
+        with output, ZipFile(output, "w", compression=ZIP_DEFLATED) as zf:
+            for file in folder.rglob("*"):
+                if not file.is_file():
+                    continue
+                arcname = file.relative_to(folder)
+                zf.write(file, arcname)
+    except Exception:
+        final_zip.unlink(missing_ok=True)
+        raise
+    return final_zip
 
 
 def _print_summary(result: ArchiveProcessResult) -> None:
@@ -364,16 +414,22 @@ def write_result_log(result: ArchiveProcessResult, log_path: Optional[Path] = No
     )
     lines.append(
         f"- Parametros de compressao: imagens qualidade={result.image_quality}; "
-        f"videos CRF={result.video_crf}; encoder requisitado={requested_encoder}; preferencia GPU={prefer_gpu}"
+        f"videos CRF={result.video_crf}"
+        + (
+            f" (alternativas: {', '.join(str(value) for value in result.video_crf_fallbacks)})"
+            if result.video_crf_fallbacks
+            else ""
+        )
+        + f"; encoder requisitado={requested_encoder}; preferencia GPU={prefer_gpu}"
     )
     if encoders_used:
         lines.append(f"- Encoders de video efetivos: {', '.join(encoders_used)}")
     lines.append(
-        f"- Estimativa de perda (imagens): qualidade alvo {result.image_quality} "
+        f"- Parametros e reducao (imagens): qualidade alvo {result.image_quality} "
         f"com reducao media {_format_percent(image_saved, image_original)}"
     )
     lines.append(
-        f"- Estimativa de perda (videos): CRF {result.video_crf} "
+        f"- Parametros e reducao (videos): CRF {result.video_crf} "
         f"com reducao media {_format_percent(video_saved, video_original)}"
     )
     lines.append("")
@@ -419,13 +475,34 @@ def write_result_log(result: ArchiveProcessResult, log_path: Optional[Path] = No
         for item in result.compressed_videos:
             rel = item.relative_path or item.source
             encoder_name = item.encoder or "libx264"
+            requested_crf = item.video_crf_requested
+            used_crf = item.video_crf_used or requested_crf or result.video_crf
+            if item.used_fallback_params and requested_crf is not None:
+                crf_label = f"{used_crf} (fallback de {requested_crf})"
+            else:
+                crf_label = str(used_crf) if used_crf is not None else "desconhecido"
             lines.append(
                 f"- {rel} | {format_bytes(item.original_size)} -> {format_bytes(item.new_size)} "
                 f"(economia {format_bytes(item.saved_bytes)}) | encoder: {encoder_name} "
+                f"| crf: {crf_label} "
                 f"| reducao {_format_percent(item.saved_bytes, item.original_size)}"
             )
     else:
         lines.append("- Nenhum")
+
+    fallback_videos = [
+        item
+        for item in result.video_results
+        if item.used_fallback_params and item.video_crf_used is not None
+    ]
+    if fallback_videos:
+        lines.append("")
+        lines.append("Videos com CRF alternativo:")
+        for item in fallback_videos:
+            rel = item.relative_path or item.source
+            requested_crf = item.video_crf_requested or "desconhecido"
+            used_crf = item.video_crf_used or "desconhecido"
+            lines.append(f"- {rel} | solicitado {requested_crf} -> usado {used_crf}")
 
     if result.error_results:
         lines.append("")
@@ -490,6 +567,11 @@ def write_batch_summary_log(
 
     archives_with_errors = [result for result in results if result.error_results]
     total_error_files = sum(len(result.error_results) for result in archives_with_errors)
+    fallback_entries: List[Tuple[ArchiveProcessResult, CompressionResult]] = []
+    for aggregate in results:
+        for item in aggregate.video_results:
+            if item.used_fallback_params and item.video_crf_used is not None:
+                fallback_entries.append((aggregate, item))
 
     def _format_duration(seconds: float) -> str:
         total = max(0, int(seconds))
@@ -544,6 +626,15 @@ def write_batch_summary_log(
         lines.append("Arquivos com erros parciais:")
         for result in archives_with_errors:
             lines.append(f"- {result.output_path} ({len(result.error_results)} erro(s))")
+
+    if fallback_entries:
+        lines.append("")
+        lines.append("Videos que usaram CRF alternativo:")
+        for result, item in fallback_entries:
+            rel = item.relative_path or item.source
+            requested = item.video_crf_requested or "desconhecido"
+            used = item.video_crf_used or "desconhecido"
+            lines.append(f"- {result.output_path.name}: {rel} | solicitado {requested} -> usado {used}")
 
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return summary_path

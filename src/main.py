@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import time
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -10,6 +9,7 @@ from typing import Iterable, List, Tuple
 from rich.console import Console
 
 from src.constants import ERROR_OUTPUT_DIR_NAME
+from src.utils.fs import move_output_file
 from src.core.epub_processor import (
     DEFAULT_IMAGE_QUALITY,
     DEFAULT_VIDEO_CRF,
@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_VIDEO_CRF,
         help="CRF do video (libx264) recomendado 18-28",
+    )
+    parser.add_argument(
+        "--video-crf-fallback",
+        type=int,
+        action="append",
+        dest="video_crf_fallback",
+        help="CRF alternativo a testar quando o principal falhar (repita a opcao para adicionar outros).",
     )
     parser.add_argument(
         "--encoder",
@@ -150,26 +157,7 @@ def relocate_results(results: List[ArchiveProcessResult], target: Path) -> None:
 
 
 def _move_result(result: ArchiveProcessResult, destination: Path) -> None:
-    source = result.output_path
-    destination = destination.resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if source == destination:
-        result.output_path = destination
-        return
-    if destination.exists():
-        destination.unlink()
-    try:
-        shutil.move(str(source), destination)
-    except Exception:
-        shutil.copy2(str(source), destination)
-    # Em ambientes Windows, shutil.move entre volumes pode deixar o arquivo original;
-    # reforcamos a remocao garantindo que a origem nao fique no local antigo.
-    if source.exists():
-        try:
-            source.unlink()
-        except OSError:
-            pass
-    result.output_path = destination
+    result.output_path = move_output_file(result.output_path, destination, result.input_path)
 
 
 def _ensure_error_destination(result: ArchiveProcessResult) -> bool:
@@ -197,6 +185,24 @@ def main() -> None:
 
     chosen_encoder = None if args.encoder == "auto" else args.encoder
     prefer_gpu = not args.cpu_only
+    sanitized_fallbacks: List[int] = []
+    ignored_fallbacks: List[int] = []
+    for raw_value in args.video_crf_fallback or []:
+        if raw_value is None:
+            continue
+        normalized_value = int(max(0, min(int(raw_value), 51)))
+        if normalized_value >= args.video_crf:
+            ignored_fallbacks.append(normalized_value)
+            continue
+        if normalized_value not in sanitized_fallbacks:
+            sanitized_fallbacks.append(normalized_value)
+    if ignored_fallbacks:
+        console.print(
+            "[yellow]Ignorando CRF(s) alternativo(s) "
+            f"{', '.join(str(v) for v in sorted(set(ignored_fallbacks)))} "
+            f"por serem maiores ou iguais ao CRF principal ({args.video_crf}).[/]"
+        )
+    fallback_crfs: Tuple[int, ...] = tuple(sanitized_fallbacks)
     max_workers = max(1, args.workers or 1)
 
     def _process_sequential(paths: List[Path]) -> List[ArchiveProcessResult]:
@@ -207,6 +213,7 @@ def main() -> None:
                     file_path,
                     image_quality=args.image_quality,
                     video_crf=args.video_crf,
+                    fallback_crfs=fallback_crfs,
                     prefer_gpu=prefer_gpu,
                     encoder=chosen_encoder,
                 )
@@ -228,6 +235,7 @@ def main() -> None:
                         file_path,
                         image_quality=args.image_quality,
                         video_crf=args.video_crf,
+                        fallback_crfs=fallback_crfs,
                         prefer_gpu=prefer_gpu,
                         encoder=chosen_encoder,
                     ): file_path

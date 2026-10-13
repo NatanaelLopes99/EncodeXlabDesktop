@@ -19,6 +19,10 @@ class CompressionResult:
     reason: Optional[str] = None
     relative_path: Optional[Path] = None
     encoder: Optional[str] = None
+    video_crf_requested: Optional[int] = None
+    video_crf_used: Optional[int] = None
+    used_fallback_params: bool = False
+    notes: Optional[str] = None
 
     @property
     def saved_bytes(self) -> int:
