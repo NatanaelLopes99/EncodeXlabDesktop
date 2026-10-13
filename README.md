@@ -143,5 +143,12 @@ requirements.txt
 - [ ] Perfis de compressao predefinidos.
 - [x] Processamento paralelo de obras diferentes.
 
+## Autor
+
+Desenvolvido por **Natanael Santos Lopes**.
+
+- [GitHub — NatanaelLopes99](https://github.com/NatanaelLopes99)
+- [LinkedIn — Natanael Santos Lopes](https://www.linkedin.com/in/natanael-lopess/)
+
 ## Licenca
 Este projeto utiliza a [licenca MIT](LICENSE).
